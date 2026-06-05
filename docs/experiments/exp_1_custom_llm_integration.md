@@ -3,69 +3,58 @@ sidebar_position: 2
 sidebar_label: "Exp 1: Custom LLM Integration"
 ---
 
-# Experiment 1: Tích hợp Custom LLM vào distilabel
+# Experiment 1: Custom LLM Integration
 
-distilabel hỗ trợ hơn 15 LLM provider (OpenAI, Anthropic, Mistral, Groq, vLLM, Ollama...) thông qua các lớp kế thừa từ `LLM` base class. Khi cần tích hợp một provider chưa có sẵn (API nội bộ của công ty, provider mới, hoặc model local đặc thù), bạn cần viết custom `LLM` class.
+## Động lực
 
----
+Distilabel cung cấp sẵn adapter cho OpenAI, Anthropic, HuggingFace Inference Endpoints và nhiều provider khác. Tuy nhiên, trong môi trường production thực tế, thường cần tích hợp với Ollama (chạy model cục bộ), Azure OpenAI (endpoint nội bộ), hoặc REST API tự xây dựng của tổ chức. Experiment này hướng dẫn cách viết custom LLM class để đáp ứng các yêu cầu đó.
 
-## 1. Hợp đồng interface của LLM Base Class
+## Interface của LLM Base Class
 
-Từ `distilabel/models/llms/base.py`, lớp `LLM` abstract yêu cầu:
+Tất cả LLM trong distilabel kế thừa từ abstract class `LLM`. Contract tối thiểu cần implement gồm hai thành phần:
 
 ```python
-from abc import ABC, abstractmethod
-from pydantic import BaseModel
-from distilabel.utils.serialization import _Serializable
+from abc import abstractmethod
+from distilabel.models.llms.base import LLM
 
-class LLM(BaseModel, _Serializable, ABC):
-    generation_kwargs: dict = {}
+class MyLLM(LLM):
 
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """Trả về tên model, dùng để logging và metadata."""
+        # Trả về tên model, dùng cho logging và metadata
         ...
 
     @abstractmethod
     def generate(
         self,
-        inputs: List["FormattedInput"],
+        inputs: list,        # List[FormattedInput] = List[List[Dict[str, str]]]
         num_generations: int = 1,
         **kwargs,
-    ) -> List["GenerateOutput"]:
-        """Nhận batch inputs, trả về batch outputs.
-        Mỗi input có thể tạo ra num_generations outputs."""
+    ) -> list:               # List[GenerateOutput] = List[List[Optional[str]]]
+        # Nhận batch inputs, trả về batch outputs
+        # Mỗi input sinh num_generations outputs
         ...
-
-    def load(self) -> None:
-        """Override để khởi tạo client, load model weights."""
-        super().load()  # init _logger
-
-    def unload(self) -> None:
-        """Override để giải phóng tài nguyên."""
-        pass
 ```
 
-`FormattedInput = List[Dict[str, str]]` tức là list of messages (ChatType). `GenerateOutput = List[Optional[str]]` tức là list `num_generations` strings cho mỗi input.
+`FormattedInput` là danh sách messages theo định dạng OpenAI chat (`[{"role": "user", "content": "..."}]`). `GenerateOutput` là danh sách `num_generations` strings (hoặc `None` nếu generation thất bại).
 
----
+## Ví dụ: Tích hợp Ollama
 
-## 2. Ví dụ: Tích hợp Ollama Local Server
-
-Ollama cho phép chạy LLM locally qua REST API. Đây là ví dụ hiện thực custom `OllamaLLM`:
+Ollama cho phép chạy các LLM open-weight cục bộ qua REST API. Đây là implementation đầy đủ:
 
 ```python
 import requests
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Optional
 from pydantic import Field
 from distilabel.models.llms.base import LLM
-from distilabel.typing import FormattedInput, GenerateOutput
 
-class CustomOllamaLLM(LLM):
-    """Custom LLM class để giao tiếp với Ollama server."""
+class OllamaLLM(LLM):
+    """LLM adapter cho Ollama local server."""
 
-    model_id: str = Field(description="Tên model trong Ollama (ví dụ: llama3, mistral)")
+    model_id: str = Field(
+        description="Tên model trong Ollama, ví dụ: llama3.2:3b, mistral"
+    )
     base_url: str = Field(
         default="http://localhost:11434",
         description="URL của Ollama server",
@@ -79,32 +68,30 @@ class CustomOllamaLLM(LLM):
         return self.model_id
 
     def load(self) -> None:
-        super().load()  # khởi tạo self._logger
+        super().load()   # bắt buộc: khởi tạo self._logger
         self._client = requests.Session()
         self._client.headers.update({"Content-Type": "application/json"})
-        # Test connection
         try:
             resp = self._client.get(f"{self.base_url}/api/tags", timeout=5)
             resp.raise_for_status()
-            self._logger.info(f"Kết nối Ollama thành công tại {self.base_url}")
-        except requests.RequestException as e:
-            raise RuntimeError(f"Không thể kết nối đến Ollama: {e}") from e
+            self._logger.info(f"Kết nối Ollama thành công: {self.base_url}")
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Không thể kết nối Ollama: {exc}") from exc
 
     def unload(self) -> None:
-        if self._client:
+        if self._client is not None:
             self._client.close()
             self._client = None
 
     def generate(
         self,
-        inputs: List[FormattedInput],
+        inputs: List,
         num_generations: int = 1,
         **kwargs,
-    ) -> List[GenerateOutput]:
+    ) -> List:
         outputs = []
-
         for messages in inputs:
-            generations_for_input = []
+            gens = []
             for _ in range(num_generations):
                 try:
                     payload = {
@@ -113,118 +100,83 @@ class CustomOllamaLLM(LLM):
                         "stream": False,
                         "options": {**self.generation_kwargs, **kwargs},
                     }
-                    response = self._client.post(
+                    resp = self._client.post(
                         f"{self.base_url}/api/chat",
                         json=payload,
                         timeout=self.timeout,
                     )
-                    response.raise_for_status()
-                    result = response.json()
-                    text = result["message"]["content"]
-                    generations_for_input.append(text)
-                except Exception as e:
-                    self._logger.warning(f"Generation thất bại: {e}")
-                    generations_for_input.append(None)
-
-            outputs.append(generations_for_input)
-
+                    resp.raise_for_status()
+                    gens.append(resp.json()["message"]["content"])
+                except Exception as exc:
+                    self._logger.warning(f"Generation thất bại: {exc}")
+                    gens.append(None)   # trả về None thay vì raise
+            outputs.append(gens)
         return outputs
 ```
 
----
-
-## 3. Sử dụng trong Pipeline
+## Sử dụng trong Pipeline
 
 ```python
 from distilabel.pipeline import Pipeline
 from distilabel.steps import LoadDataFromDicts
 from distilabel.steps.tasks import TextGeneration
 
-ollama_llm = CustomOllamaLLM(
+ollama = OllamaLLM(
     model_id="llama3.2:3b",
-    base_url="http://localhost:11434",
     generation_kwargs={"temperature": 0.7, "num_predict": 512},
 )
 
-with Pipeline("local-ollama-pipeline") as pipeline:
-    load_data = LoadDataFromDicts(
+with Pipeline(name="ollama-pipeline") as pipeline:
+    load = LoadDataFromDicts(
         data=[
-            {"instruction": "Giải thích quantum entanglement bằng tiếng Việt."},
-            {"instruction": "Viết một hàm Python tính số Fibonacci."},
-            {"instruction": "Phân tích ưu điểm của kiến trúc Transformer."},
+            {"instruction": "Giải thích cơ chế attention trong Transformer."},
+            {"instruction": "So sánh DPO và PPO cho RLHF."},
         ],
     )
-
-    generate = TextGeneration(
-        llm=ollama_llm,
-        num_generations=1,
-        input_batch_size=3,
-    )
-
-    load_data >> generate
+    gen = TextGeneration(llm=ollama, num_generations=1)
+    load >> gen
 
 if __name__ == "__main__":
     distiset = pipeline.run()
     print(distiset["generate_0"].to_pandas()[["instruction", "generation"]])
 ```
 
----
+## Checklist khi viết Custom LLM
 
-## 4. Async LLM cho throughput cao hơn
+Bảng dưới tổng hợp các điểm bắt buộc và khuyến nghị khi implement custom LLM class:
 
-Nếu provider hỗ trợ async (như hầu hết HTTP API), override `agenerate()` để distilabel tự động gọi song song:
+| Yêu cầu | Lý do |
+|---|---|
+| Gọi `super().load()` trong `load()` | Khởi tạo `self._logger` |
+| Trả về `None` khi generation lỗi | Pipeline xử lý gracefully, không crash |
+| Dùng `pydantic.Field` cho config | Serialization và deserialization hoạt động |
+| `len(output) == len(inputs)` | Contract bắt buộc của `generate()` |
+| `len(output[i]) == num_generations` | Mỗi input phải có đúng số outputs |
+| Giải phóng resources trong `unload()` | Tránh memory leak khi pipeline kết thúc |
+
+## Nâng cao: Async generation
+
+Nếu provider hỗ trợ async, override `agenerate()` để tăng throughput:
 
 ```python
-import asyncio
-import aiohttp
+import asyncio, aiohttp
 
-class AsyncOllamaLLM(CustomOllamaLLM):
-
-    async def agenerate(
-        self,
-        input: FormattedInput,
-        num_generations: int = 1,
-        **kwargs,
-    ) -> GenerateOutput:
-        """Async version: nhiều calls chạy song song trong cùng một batch."""
+class AsyncOllamaLLM(OllamaLLM):
+    async def agenerate(self, input: list, num_generations: int = 1, **kwargs) -> list:
         async with aiohttp.ClientSession() as session:
-            tasks = []
-            for _ in range(num_generations):
-                payload = {
-                    "model": self.model_id,
-                    "messages": input,
-                    "stream": False,
-                    "options": {**self.generation_kwargs, **kwargs},
-                }
-                tasks.append(
-                    session.post(
-                        f"{self.base_url}/api/chat",
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    )
+            tasks = [
+                session.post(
+                    f"{self.base_url}/api/chat",
+                    json={"model": self.model_id, "messages": input, "stream": False},
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
                 )
-
+                for _ in range(num_generations)
+            ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            outputs = []
-            for result in results:
-                if isinstance(result, Exception):
-                    outputs.append(None)
-                else:
-                    data = await result.json()
-                    outputs.append(data["message"]["content"])
-
-            return outputs
+            return [
+                None if isinstance(r, Exception) else (await r.json())["message"]["content"]
+                for r in results
+            ]
 ```
 
-distilabel tự detect `agenerate()` và sẽ gọi nó thay vì `generate()` cho toàn bộ batch, tận dụng asyncio để tăng throughput đáng kể so với gọi tuần tự.
-
----
-
-## 5. Checklist khi viết Custom LLM
-
-- `model_name` property trả về string nhất quán (dùng cho logging, metadata).
-- `load()` phải gọi `super().load()` để khởi tạo `self._logger`.
-- `generate()` luôn trả về list có độ dài bằng `len(inputs)`, mỗi phần tử là list `num_generations` strings.
-- Trả về `None` thay vì raise exception khi một generation thất bại (pipeline xử lý gracefully).
-- `unload()` giải phóng tất cả resources (connections, GPU memory).
-- Dùng `pydantic.Field` cho tất cả config attributes để serialization hoạt động đúng.
+Distilabel tự detect `agenerate()` và gọi nó thay vì `generate()`, cho phép các calls trong cùng một batch chạy song song, tăng throughput đáng kể so với gọi tuần tự.
